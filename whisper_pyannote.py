@@ -491,53 +491,53 @@ class TranscriptRefiner:
             system_prompt = custom_prompt
         else:
             system_prompt = """You are a transcript refinement expert used in an automated speech pipeline.
+                Your job is to CLEAN the text but NEVER break alignment.
 
-Your job is to CLEAN the text but NEVER break alignment.
+                NON-NEGOTIABLE RULES (follow in this exact priority order):
 
-NON-NEGOTIABLE RULES (follow in this exact priority order):
+                1. DO NOT change the number of segments. If input has N segments, output MUST have N segments.
+                2. DO NOT change timestamps. Keep each segment's `start` and `end` exactly as in the input.
+                3. DO NOT merge, split, reorder, or drop segments.
+                4. Only change:
+                - `speaker`
+                - `text`
+                Keep everything else as-is.
 
-1. DO NOT change the number of segments. If input has N segments, output MUST have N segments.
-2. DO NOT change timestamps. Keep each segment's `start` and `end` exactly as in the input.
-3. DO NOT merge, split, reorder, or drop segments.
-4. Only change:
-   - `speaker`
-   - `text`
-   Keep everything else as-is.
+                REFINEMENT RULES:
 
-REFINEMENT RULES:
+                1. Speaker assignment and merging:
+                - Use stable, descriptive labels: “Person A”, “Person B”, “Person C”, etc. Assign the same label for the same speaker across all segments in this chunk.
+                - If a short segment (1-3 words or ≤1 second duration) labeled as UNKNOWN appears between two consecutive segments from the same speaker, assume it is a continuation of the same person's speech.
+                - In such cases, reassign the UNKNOWN segment's speaker to match the surrounding speaker.
+                - Then MERGE all three (or more) consecutive segments into a single segment.
+                - Set the merged segment's `start` to the first segment's start and `end` to the last segment's end.
+                - Concatenate their texts naturally (with a space or comma where appropriate).
+                - Remove redundant merged segments, reducing the total count accordingly.
 
-1. Speaker identification:
-   - If the segment clearly identifies the speaker (“I'm John”, “This is Rohan”, “Thanks, Priya”), use that name as `speaker`.
-   - If the speaker is unknown, use descriptive stable labels: “Person A”, “Person B”, “Person C”, ... (not SPEAKER_00).
-   - Use the SAME label for the SAME person across all segments in this chunk.
-   - Do NOT invent names that are not spoken or strongly implied.
+                2. Spelling & grammar:
+                - Fix obvious ASR mistakes and casing.
+                - Keep technical terms, product names, code, and IDs exactly if they look intentional.
 
-2. Spelling & grammar:
-   - Fix obvious ASR mistakes and casing.
-   - Keep technical terms, product names, code, and IDs exactly if they look intentional.
+                3. Punctuation:
+                - Add commas, periods, and question marks to make it readable.
+                - Do not add long stylistic rewrites.
 
-3. Punctuation:
-   - Add commas, periods, and question marks to make it readable.
-   - Do not add long stylistic rewrites.
+                4. Multilingual / Hindi-English:
+                - When text is in Hindi or mixed Hindi-English, translate to clear conversational English.
+                - Preserve cultural/intent nuance (“yaar”, “acha”, “haan”) by using lightweight equivalents (“hey”, “okay”, “yeah”) when needed.
+                - If translation is ambiguous, keep the original phrase.
 
-4. Multilingual / Hindi-English:
-   - When text is in Hindi or mixed Hindi-English, translate to clear conversational English.
-   - Preserve cultural/intent nuance (“yaar”, “acha”, “haan”) by using lightweight equivalents (“hey”, “okay”, “yeah”) when needed.
-   - If translation is ambiguous, keep the original phrase.
+                5. Filler words:
+                - Remove only obvious fillers that don't change meaning (“um”, “uh”, “like” at the start).
+                - Keep hesitations that show intent (“I… I don't know”, “let me think”).
 
-5. Filler words:
-   - Remove only obvious fillers that don't change meaning (“um”, “uh”, “like” at the start).
-   - Keep hesitations that show intent (“I… I don't know”, “let me think”).
+                OUTPUT FORMAT:
 
-OUTPUT FORMAT:
-
-- Return ONLY a JSON array.
-- Each item MUST have exactly these keys: `speaker`, `text`, `start`, `end`.
-- `start` and `end` MUST be the original numeric values from input.
-- Do NOT wrap the JSON in markdown fences.
-- Do NOT add explanations, comments, or metadata."""
-
-
+                - Return ONLY a JSON array.
+                - Each item MUST have exactly these keys: `speaker`, `text`, `start`, `end`.
+                - `start` and `end` MUST be the original numeric values from input unless segments were merged, in which case use the earliest start and latest end of the merged range.
+                - Do NOT wrap the JSON in markdown fences.
+                - Do NOT add explanations, comments, or metadata."""
         user_prompt = f"""Refine this transcript chunk:
 
 {transcript_text}
