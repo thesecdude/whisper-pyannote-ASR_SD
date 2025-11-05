@@ -1,15 +1,3 @@
-"""
-Whisper + Pyannote Speaker Diarization Integration
-
-This module provides functionality to combine:
-- Whisper ASR for transcription with word-level timestamps
-- Pyannote.audio for speaker diarization
-- Alignment logic to assign speakers to transcribed words
-
-Author: Integration Script
-License: MIT
-"""
-
 import argparse
 import json
 import os
@@ -35,7 +23,6 @@ except ImportError:
 class WhisperDiarization:
     """
     Combines Whisper transcription with pyannote speaker diarization.
-
     This class handles:
     1. Audio transcription with word-level timestamps (Whisper)
     2. Speaker diarization (pyannote.audio)
@@ -51,7 +38,6 @@ class WhisperDiarization:
     ):
         """
         Initialize the Whisper + Diarization pipeline.
-
         Args:
             whisper_model: Whisper model name (tiny, base, small, medium, large, large-v2, large-v3, turbo*)
                            *'turbo' is valid only if your repo/fork exposes it.
@@ -76,7 +62,7 @@ class WhisperDiarization:
         if hf_token:
             self.diarization_pipeline = Pipeline.from_pretrained(
                 diarization_model,
-                use_auth_token=hf_token
+                token=hf_token
             )
         else:
             try:
@@ -84,8 +70,6 @@ class WhisperDiarization:
             except Exception as e:
                 print("\nError: Pyannote models require HuggingFace authentication.")
                 print("Please provide a HuggingFace token using --hf-token")
-                print("Get your token from: https://huggingface.co/settings/tokens")
-                print("Also accept the user conditions at: https://huggingface.co/pyannote/speaker-diarization-3.1")
                 raise e
 
         # Move diarization to the same device (fix #8: make this robust)
@@ -103,7 +87,7 @@ class WhisperDiarization:
         num_speakers: Optional[int] = None,
         min_speakers: Optional[int] = None,
         max_speakers: Optional[int] = None,
-        multilingual: bool = False,
+        multilingual: bool = True,
         **whisper_kwargs
     ) -> Dict:
         """
@@ -382,18 +366,16 @@ class TranscriptRefiner:
         Returns:
             Refined result with improved speaker labels and text
         """
-        print("\nStep 4/4: Refining transcript with Claude AI...")
+        print("\nStep 4/4: Refining transcript with Claude...")
 
         segments = result["segments"]
         word_segments = result["word_segments"]
 
-        # STEP 1: Merge consecutive segments from same speaker BEFORE LLM refinement
-        # This preserves Pyannote's largest natural boundaries
-        print(f"  → Merging consecutive speaker segments...")
+        # STEP 1: Merge consecutive segments from same speaker before LLM refinement
+        print(f"    Merging consecutive speaker segments...")
         print(f"    Original segments: {len(segments)}")
         merged_input_segments = self._merge_consecutive_segments(segments)
         print(f"    Merged segments: {len(merged_input_segments)}")
-        print(f"    Reduction: {len(segments) - len(merged_input_segments)} segments ({(len(segments) - len(merged_input_segments)) / len(segments) * 100:.1f}%)")
 
         # STEP 2: Create chunks based on token limit, never splitting speaker segments
         print(f"  → Creating chunks (max {max_tokens} tokens per chunk)...")
@@ -412,27 +394,23 @@ class TranscriptRefiner:
         # Update speaker labels in word segments based on refined segments
         refined_word_segments = self._update_word_segments(word_segments, refined_segments)
 
-        # Detect speaker name patterns and create mapping
-        speaker_mapping = self._create_speaker_mapping(refined_segments)
-
-        # Apply speaker mapping
-        final_segments = self._apply_speaker_mapping(refined_segments, speaker_mapping)
-        final_word_segments = self._apply_speaker_mapping_to_words(refined_word_segments, speaker_mapping)
+        # Use refined segments directly (no heuristic name mapping)
+        final_segments = refined_segments
+        final_word_segments = refined_word_segments
 
         # Get unique speakers after refinement
         speakers = sorted(set(seg["speaker"] for seg in final_segments if seg["speaker"]))
 
-        print(f"✓ Refinement complete! Identified speakers: {', '.join(speakers)}")
+        print(f"  Refinement complete! Identified speakers: {', '.join(speakers)}")
         print(f"  Final segments: {len(final_segments)}")
 
         return {
-            "text": result["text"],  # Keep original full text
+            "text": result["text"], 
             "segments": final_segments,
             "word_segments": final_word_segments,
             "language": result["language"],
             "speakers": speakers,
-            "refinement_applied": True,
-            "speaker_mapping": speaker_mapping
+            "refinement_applied": True
         }
 
     def _create_smart_chunks(self, segments: List[Dict], max_tokens: int) -> List[List[Dict]]:
@@ -453,7 +431,6 @@ class TranscriptRefiner:
         current_chunk = []
         current_tokens = 0
 
-        # Reserve tokens for system prompt and formatting overhead (~2000 tokens)
         usable_tokens = max_tokens - 2000
 
         for segment in segments:
@@ -464,8 +441,6 @@ class TranscriptRefiner:
 
             # Check if adding this segment would exceed limit
             if current_tokens + segment_tokens > usable_tokens and current_chunk:
-                # Current chunk is full, start new chunk
-                # CRITICAL: Do NOT add segment to current chunk - it goes to next chunk
                 chunks.append(current_chunk)
                 current_chunk = [segment]
                 current_tokens = segment_tokens
@@ -655,72 +630,9 @@ Do not include any explanation or markdown formatting, just the JSON array."""
 
         return updated_words
 
-    def _create_speaker_mapping(self, segments: List[Dict]) -> Dict[str, str]:
-        """
-        Fix (#6): Create a stable mapping from generic SPEAKER_XX labels to either
-        extracted names ("I am John", "My name is Priya") or deterministic Person A/B/C.
-        """
-        mapping: Dict[str, str] = {}
-        fallback_bucket: Dict[str, str] = {}
-        name_pat = re.compile(
-            r"\b(i am|i'm|this is|my name is)\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)?)\b",
-            re.IGNORECASE
-        )
-
-        next_person_ord = 0
-        def next_person():
-            nonlocal next_person_ord
-            label = f"Person {chr(65 + next_person_ord)}"
-            next_person_ord += 1
-            return label
-
-        for seg in segments:
-            spk = seg.get("speaker")
-            txt = seg.get("text", "") or ""
-            if not spk:
-                continue
-            if spk.startswith("SPEAKER_") or spk.upper() in {"UNKNOWN", "NA", "UNK"}:
-                m = name_pat.search(txt)
-                if m:
-                    candidate = m.group(2).strip()
-                    if spk not in mapping:
-                        mapping[spk] = candidate
-                else:
-                    if spk not in fallback_bucket:
-                        fallback_bucket[spk] = next_person()
-
-        # Merge fallbacks without clobbering extracted names
-        for k, v in fallback_bucket.items():
-            mapping.setdefault(k, v)
-
-        return mapping
-
-    def _apply_speaker_mapping(self, segments: List[Dict], mapping: Dict[str, str]) -> List[Dict]:
-        """Apply speaker name mapping to segments."""
-        if not mapping:
-            return segments
-
-        return [
-            {**seg, "speaker": mapping.get(seg.get("speaker"), seg.get("speaker"))}
-            for seg in segments
-        ]
-
-    def _apply_speaker_mapping_to_words(self, word_segments: List[Dict], mapping: Dict[str, str]) -> List[Dict]:
-        """Apply speaker name mapping to word segments."""
-        if not mapping:
-            return word_segments
-
-        return [
-            {**word, "speaker": mapping.get(word.get("speaker"), word.get("speaker"))}
-            for word in word_segments
-        ]
-
     def _merge_consecutive_segments(self, segments: List[Dict]) -> List[Dict]:
         """
         Merge consecutive segments from the same speaker for better readability.
-
-        This combines multiple short segments from the same speaker into longer,
-        more natural conversational blocks.
         """
         if not segments:
             return []
@@ -778,34 +690,6 @@ def format_timestamp(seconds: float) -> str:
     minutes = int((seconds % 3600) // 60)
     secs = seconds % 60
     return f"{hours:02d}:{minutes:02d}:{secs:06.3f}"
-
-
-def _wrap_srt(text: str, width: int = 42, max_lines: int = 2) -> str:
-    """
-    Fix (#7): Soft-wrap SRT text to improve readability (≈42 chars/line, max 2 lines).
-    """
-    words = text.split()
-    lines, cur = [], ""
-    for w in words:
-        if not cur:
-            cur = w
-        elif len(cur) + 1 + len(w) <= width:
-            cur += " " + w
-        else:
-            lines.append(cur)
-            cur = w
-        if len(lines) >= max_lines:
-            break
-    if len(lines) < max_lines and cur:
-        lines.append(cur)
-    return "\n".join(lines[:max_lines])
-
-
-def _chars_per_sec(text: str, start: float, end: float) -> Optional[float]:
-    dur = max(0.0, end - start)
-    if dur <= 0:
-        return None
-    return len(text.replace("\n", " ")) / dur
 
 
 def save_results(result: Dict, output_path: str, format: str = "all", suffix: str = ""):
@@ -1029,69 +913,63 @@ def main():
         return
 
     # Transcribe
-    result = pipeline.transcribe(
-        args.audio,
-        language=args.language,
-        num_speakers=args.num_speakers,
-        min_speakers=args.min_speakers,
-        max_speakers=args.max_speakers,
-        multilingual=args.multilingual
-    )
+    try:
+        result = pipeline.transcribe(
+            args.audio,
+            language=args.language,
+            num_speakers=args.num_speakers,
+            min_speakers=args.min_speakers,
+            max_speakers=args.max_speakers,
+            multilingual=args.multilingual
+        )
 
-    # Determine output path
-    if args.output is None:
-        audio_path = Path(args.audio)
-        output_path = audio_path.parent / f"{audio_path.stem}_transcription"
-    else:
-        output_path = args.output
+        # Determine output path
+        if args.output is None:
+            audio_path = Path(args.audio)
+            output_path = audio_path.parent / f"{audio_path.stem}_transcription"
+        else:
+            output_path = args.output
 
-    # Save raw results
-    save_results(result, output_path, args.format, suffix="_raw" if args.refine_with_llm else "")
+        # Save raw results
+        save_results(result, output_path, args.format, suffix="_raw" if args.refine_with_llm else "")
 
-    # Apply LLM refinement if requested (Vertex creds behavior intentionally unchanged)
-    if args.refine_with_llm:
-        try:
-            refiner = TranscriptRefiner(
-                project_id=args.vertex_project_id,
-                region=args.vertex_region,
-                model=args.claude_model
-            )
+        # Apply LLM refinement if requested (Vertex creds behavior intentionally unchanged)
+        if args.refine_with_llm:
+            try:
+                refiner = TranscriptRefiner(
+                    project_id=args.vertex_project_id,
+                    region=args.vertex_region,
+                    model=args.claude_model
+                )
 
-            refined_result = refiner.refine_transcript(
-                result,
-                max_tokens=args.max_tokens,
-                custom_prompt=args.refinement_prompt
-            )
+                refined_result = refiner.refine_transcript(
+                    result,
+                    max_tokens=args.max_tokens,
+                    custom_prompt=args.refinement_prompt
+                )
 
-            # Save refined results
-            save_results(refined_result, output_path, args.format, suffix="_refined")
+                # Save refined results
+                save_results(refined_result, output_path, args.format, suffix="_refined")
 
-            # Use refined result for summary display
-            result = refined_result
+                # Use refined result for summary display
+                result = refined_result
 
-        except Exception as e:
-            print(f"\nError during LLM refinement: {e}")
-            print("Continuing with raw transcript only...")
-    else:
-        # Save results without suffix if no refinement
-        pass
+            except Exception as e:
+                print(f"\nError during LLM refinement: {e}")
+                print("Continuing with raw transcript only...")
+        else:
+            # Save results without suffix if no refinement
+            pass
+    except KeyboardInterrupt:
+        print("\n\n⚠ Transcription cancelled by user")
+        return
 
     # Print summary
-    print("\n" + "="*60)
     print("TRANSCRIPTION SUMMARY")
-    print("="*60)
     print(f"Language: {result['language']}")
     print(f"Speakers detected: {len(result['speakers'])}")
     print(f"Speakers: {', '.join(result['speakers'])}")
     print(f"\nSegments: {len(result['segments'])}")
-    print("\nFirst few segments:")
-    for i, seg in enumerate(result['segments'][:5], 1):
-        speaker = seg['speaker'] or 'UNKNOWN'
-        print(f"\n{i}. [{speaker}] ({format_timestamp(seg['start'])} - {format_timestamp(seg['end'])})")
-        print(f"   {seg['text'].strip()}")
-
-    if len(result['segments']) > 5:
-        print(f"\n... and {len(result['segments']) - 5} more segments")
 
 
 if __name__ == "__main__":
