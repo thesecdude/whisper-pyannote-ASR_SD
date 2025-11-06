@@ -1,24 +1,13 @@
-"""
-Whisper + Pyannote Speaker Diarization Integration
-
-This module provides functionality to combine:
-- Whisper ASR for transcription with word-level timestamps
-- Pyannote.audio for speaker diarization
-- Alignment logic to assign speakers to transcribed words
-
-Author: Integration Script
-License: MIT
-"""
-
 import argparse
 import json
 import os
 import re
-import warnings
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from bisect import bisect_right
-from datetime import timedelta
 
 import torch
 import whisper
@@ -32,14 +21,13 @@ except ImportError:
     ANTHROPIC_AVAILABLE = False
 
 
-class WhisperDiarization:
+class ParallelWhisperDiarization:
     """
-    Combines Whisper transcription with pyannote speaker diarization.
-
-    This class handles:
-    1. Audio transcription with word-level timestamps (Whisper)
-    2. Speaker diarization (pyannote.audio)
-    3. Alignment of speakers to transcribed words
+    Parallel processing of Whisper transcription and Pyannote diarization.
+    This class:
+    1. Runs Whisper and Pyannote concurrently on the same audio
+    2. Merges results deterministically using timestamp alignment
+    3. Optionally refines with LLM
     """
 
     def __init__(
@@ -50,15 +38,12 @@ class WhisperDiarization:
         hf_token: Optional[str] = None,
     ):
         """
-        Initialize the Whisper + Diarization pipeline.
-
+        Initialize the parallel pipeline.
         Args:
-            whisper_model: Whisper model name (tiny, base, small, medium, large, large-v2, large-v3, turbo*)
-                           *'turbo' is valid only if your repo/fork exposes it.
+            whisper_model: Whisper model name (tiny, base, small, medium, large, large-v2, large-v3, turbo)
             diarization_model: HuggingFace model for diarization
             device: Device to use ('cuda', 'cpu', or None for auto-detect)
             hf_token: HuggingFace token for accessing pyannote models
-                     (get from: https://huggingface.co/settings/tokens)
         """
         if device is None:
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -67,7 +52,7 @@ class WhisperDiarization:
 
         print(f"Using device: {self.device}")
 
-        # Load Whisper model (leave 'turbo' alone if your repo supports it)
+        # Load Whisper model
         print(f"Loading Whisper model: {whisper_model}...")
         self.whisper_model = whisper.load_model(whisper_model, device=self.device)
 
@@ -76,7 +61,7 @@ class WhisperDiarization:
         if hf_token:
             self.diarization_pipeline = Pipeline.from_pretrained(
                 diarization_model,
-                use_auth_token=hf_token
+                token=hf_token
             )
         else:
             try:
@@ -84,16 +69,13 @@ class WhisperDiarization:
             except Exception as e:
                 print("\nError: Pyannote models require HuggingFace authentication.")
                 print("Please provide a HuggingFace token using --hf-token")
-                print("Get your token from: https://huggingface.co/settings/tokens")
-                print("Also accept the user conditions at: https://huggingface.co/pyannote/speaker-diarization-3.1")
                 raise e
 
-        # Move diarization to the same device (fix #8: make this robust)
+        # Move diarization to the same device
         if self.device == "cuda" and torch.cuda.is_available():
             try:
                 self.diarization_pipeline.to(torch.device("cuda"))
             except Exception:
-                # if the pipeline doesn't support .to or CUDA isn't properly configured, silently continue on CPU
                 pass
 
     def transcribe(
@@ -107,48 +89,41 @@ class WhisperDiarization:
         **whisper_kwargs
     ) -> Dict:
         """
-        Transcribe audio with speaker diarization.
-
+        Transcribe audio with speaker diarization using parallel processing.
         Args:
             audio_path: Path to audio file
             language: Language code (e.g., 'en', 'es', 'fr') or None for auto-detect
             num_speakers: Exact number of speakers (if known)
             min_speakers: Minimum number of speakers
             max_speakers: Maximum number of speakers
-            multilingual: If True, allows language mixing (code-switching) in the audio
+            multilingual: If True, allows language mixing (code-switching)
             **whisper_kwargs: Additional arguments for Whisper transcribe()
-
         Returns:
             Dictionary containing:
                 - 'text': Full transcription
                 - 'segments': List of segments with speaker labels
                 - 'word_segments': List of individual words with speakers and timestamps
-                - 'language': Detected/specified language (or 'mixed' for multilingual)
+                - 'language': Detected/specified language
                 - 'speakers': List of unique speakers
+                - 'timing': Processing time breakdown
         """
-        print(f"\nProcessing: {audio_path}")
+        print(f"\n{'='*60}")
+        print(f"PARALLEL PROCESSING: {audio_path}")
+        print(f"{'='*60}")
 
-        # Step 1: Transcribe with Whisper (with word timestamps)
-        print("Step 1/3: Running Whisper transcription...")
+        start_time = time.time()
 
+        # Prepare parameters for both tasks
         transcribe_options = {
             "word_timestamps": True,
             **whisper_kwargs
         }
 
-        # For multilingual/code-switching: don't specify language, let Whisper auto-detect
-        # Also use task='transcribe' for better multilingual support
         if multilingual:
             print("  → Multilingual mode enabled (code-switching detection)")
             transcribe_options["task"] = "transcribe"
-            # Don't set language - let it auto-detect per segment
         else:
             transcribe_options["language"] = language
-
-        whisper_result = self.whisper_model.transcribe(audio_path, **transcribe_options)
-
-        # Step 2: Run speaker diarization
-        print("Step 2/3: Running speaker diarization...")
 
         diarization_options = {}
         if num_speakers is not None:
@@ -157,31 +132,122 @@ class WhisperDiarization:
             diarization_options["min_speakers"] = min_speakers
             diarization_options["max_speakers"] = max_speakers
 
-        diarization = self.diarization_pipeline(audio_path, **diarization_options)
+        # Run Whisper and Pyannote in parallel
+        print("\nStep 1/3: Running Whisper and Pyannote in parallel...")
+        print("  Launching parallel workers...")
 
-        # Step 3: Align speakers with transcribed words
-        print("Step 3/3: Aligning speakers with transcription...")
+        whisper_result = None
+        diarization_result = None
+        whisper_time = 0
+        diarization_time = 0
 
-        result = self._align_speakers_with_transcription(whisper_result, diarization)
+        executor = ThreadPoolExecutor(max_workers=2)
+        try:
+            # Submit both tasks
+            whisper_future = executor.submit(
+                self._run_whisper,
+                audio_path,
+                transcribe_options
+            )
+            diarization_future = executor.submit(
+                self._run_diarization,
+                audio_path,
+                diarization_options
+            )
 
-        print(f"✓ Transcription complete! Detected {len(result['speakers'])} speakers.")
+            # Wait for completion and collect results
+            for future in as_completed([whisper_future, diarization_future]):
+                try:
+                    if future == whisper_future:
+                        whisper_result, whisper_time = future.result(timeout=None)
+                        print(f"   Whisper completed ({whisper_time:.2f}s)")
+                    else:
+                        diarization_result, diarization_time = future.result(timeout=None)
+                        print(f"   Pyannote completed ({diarization_time:.2f}s)")
+                except KeyboardInterrupt:
+                    print("\n\n Interrupted by user! Cancelling workers...")
+                    whisper_future.cancel()
+                    diarization_future.cancel()
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    raise
+        except KeyboardInterrupt:
+            print("\n Transcription cancelled by user")
+            raise
+        finally:
+            executor.shutdown(wait=True)
+
+        parallel_time = time.time() - start_time
+        print(f"\n  Total parallel time: {parallel_time:.2f}s")
+        print(f"  Time saved: {(whisper_time + diarization_time - parallel_time):.2f}s")
+
+        # Step 2: Merge results deterministically
+        print("\nStep 2/3: Merging Whisper transcription with Pyannote speakers...")
+        merge_start = time.time()
+
+        result = self._merge_results(whisper_result, diarization_result)
+
+        merge_time = time.time() - merge_start
+        total_time = time.time() - start_time
+
+        print(f"  Merge completed ({merge_time:.2f}s)")
+        print(f"\nProcessing complete! Total time: {total_time:.2f}s")
+        print(f"  Detected {len(result['speakers'])} speakers: {', '.join(result['speakers'])}")
+
+        # Add timing information
+        result['timing'] = {
+            'whisper_time': whisper_time,
+            'diarization_time': diarization_time,
+            'parallel_time': parallel_time,
+            'merge_time': merge_time,
+            'total_time': total_time,
+            'time_saved': whisper_time + diarization_time - parallel_time
+        }
 
         return result
 
-    def _align_speakers_with_transcription(
+    def _run_whisper(
+        self,
+        audio_path: str,
+        options: Dict
+    ) -> Tuple[Dict, float]:
+        """Run Whisper transcription (designed to run in parallel)."""
+        print("  [Whisper] Starting transcription...")
+        start_time = time.time()
+
+        result = self.whisper_model.transcribe(audio_path, **options)
+
+        elapsed = time.time() - start_time
+        return result, elapsed
+
+    def _run_diarization(
+        self,
+        audio_path: str,
+        options: Dict
+    ) -> Tuple[Annotation, float]:
+        """Run Pyannote diarization (designed to run in parallel)."""
+        print("  [Pyannote] Starting speaker diarization...")
+        start_time = time.time()
+
+        result = self.diarization_pipeline(audio_path, **options)
+
+        elapsed = time.time() - start_time
+        return result, elapsed
+
+    def _merge_results(
         self,
         whisper_result: Dict,
         diarization: Annotation
     ) -> Dict:
         """
-        Align speaker diarization with Whisper word timestamps.
-
+        Deterministically merge Whisper transcription with Pyannote diarization.
+        Uses timestamp-based alignment:
+        - For each word from Whisper, find the speaker active at that time from Pyannote
+        - Groups consecutive words by speaker into segments
         Args:
             whisper_result: Output from Whisper transcribe()
             diarization: Pyannote Annotation object
-
         Returns:
-            Aligned result with speaker labels
+            Merged result with speaker labels aligned to words
         """
         # Extract words with timestamps from Whisper result
         word_segments = []
@@ -205,7 +271,7 @@ class WhisperDiarization:
                 })
             else:
                 for word_info in segment["words"]:
-                    # Get speaker at the middle of the word
+                    # Get speaker at the middle of the word (deterministic alignment)
                     word_middle = (word_info["start"] + word_info["end"]) / 2
                     speaker = self._get_speaker_at_timestamp(diarization, word_middle)
 
@@ -218,7 +284,7 @@ class WhisperDiarization:
                         "language": segment_language
                     })
 
-        # Group consecutive words by the same speaker into segments (fix #2 spacing)
+        # Group consecutive words by the same speaker into segments
         speaker_segments = self._group_by_speaker(word_segments)
 
         # Get unique speakers
@@ -238,20 +304,18 @@ class WhisperDiarization:
         timestamp: float
     ) -> Optional[str]:
         """
-        Get the speaker active at a specific timestamp.
-
+        Get the speaker active at a specific timestamp (deterministic).
+        When multiple speakers overlap, chooses the one whose segment center
+        is closest to the timestamp for stability.
         Args:
             diarization: Pyannote Annotation
             timestamp: Time in seconds
-
         Returns:
             Speaker label or None if no speaker at that time
-
-        Fix (#3): when multiple segments cover the same instant, pick the one
-        whose center is closest to the timestamp (more stable than first-match).
         """
         best_speaker = None
         best_dist = None
+
         for segment, _, speaker in diarization.itertracks(yield_label=True):
             if segment.start <= timestamp <= segment.end:
                 center = (segment.start + segment.end) / 2.0
@@ -259,27 +323,28 @@ class WhisperDiarization:
                 if best_dist is None or dist < best_dist:
                     best_dist = dist
                     best_speaker = speaker
+
         return best_speaker
 
     def _smart_join(self, prev_text: str, token: str) -> str:
-        """
-        Fix (#2): smart spacing around punctuation when joining tokens into segment text.
-        """
+        """Smart spacing around punctuation when joining tokens."""
         if not prev_text:
             return token
 
-        closing_punct = {",", ".", "!", "?", ":", ";", ")", "]", "}", "’", "”", "'"}
-        opening_punct = {"(", "[", "{", "‘", "“"}
+        # Punctuation that should not have space before them
+        closing_punct = {",", ".", "!", "?", ":", ";", ")", "]", "}", "'"}
+        # Punctuation that should not have space after them
+        opening_punct = {"(", "[", "{", "'"}
 
         # No space before closing punctuation
         if token in closing_punct:
             return prev_text + token
 
-        # No space after opening punctuation, or if prev ends with opening
+        # No space after opening punctuation
         if prev_text[-1] in opening_punct:
             return prev_text + token
 
-        # Apostrophes within words: don't add spaces around "'"
+        # Apostrophes within words
         if token == "'" and prev_text and prev_text[-1].isalnum():
             return prev_text + token
 
@@ -289,8 +354,7 @@ class WhisperDiarization:
     def _group_by_speaker(self, word_segments: List[Dict]) -> List[Dict]:
         """
         Group consecutive words by the same speaker into segments.
-
-        Fix (#2): build readable text with correct spaces around punctuation.
+        Uses smart spacing for proper punctuation handling.
         """
         if not word_segments:
             return []
@@ -326,10 +390,6 @@ class WhisperDiarization:
 class TranscriptRefiner:
     """
     Uses Claude API to refine transcripts by:
-    - Improving speaker identification using pattern matching
-    - Fixing spelling and grammatical errors
-    - Adding proper punctuation
-    - Translating Hindi/mixed language to English while preserving context
     """
 
     def __init__(
@@ -338,14 +398,7 @@ class TranscriptRefiner:
         region: str = "us-east5",
         model: str = "claude-3-5-sonnet-v2@20241022"
     ):
-        """
-        Initialize the transcript refiner using Vertex AI.
-
-        Args:
-            project_id: Google Cloud project ID (uses ANTHROPIC_VERTEX_PROJECT_ID env var if not provided)
-            region: Vertex AI region (default: us-east5)
-            model: Claude model to use via Vertex AI
-        """
+        """Initialize the transcript refiner using Vertex AI."""
         if not ANTHROPIC_AVAILABLE:
             raise ImportError("anthropic package not installed. Install with: pip install anthropic")
 
@@ -359,7 +412,6 @@ class TranscriptRefiner:
         self.region = region
         self.model = model
 
-        # Initialize Vertex AI client (unchanged per your request)
         self.client = AnthropicVertex(
             project_id=self.project_id,
             region=self.region
@@ -371,18 +423,8 @@ class TranscriptRefiner:
         max_tokens: int = 200000,
         custom_prompt: Optional[str] = None
     ) -> Dict:
-        """
-        Refine the entire transcript using Claude API.
-
-        Args:
-            result: Output from WhisperDiarization.transcribe()
-            max_tokens: Maximum tokens per chunk (default: 200k for ~256k context window)
-            custom_prompt: Optional custom refinement instructions
-
-        Returns:
-            Refined result with improved speaker labels and text
-        """
-        print("\nStep 4/4: Refining transcript with Claude AI...")
+        """Refine the entire transcript using Claude API."""
+        print("\nStep 3/3: Refining transcript with Claude AI...")
 
         segments = result["segments"]
         word_segments = result["word_segments"]
@@ -409,30 +451,27 @@ class TranscriptRefiner:
             refined_chunk = self._refine_chunk(chunk, custom_prompt)
             refined_segments.extend(refined_chunk)
 
-        # Update speaker labels in word segments based on refined segments
+        # Update word segments
         refined_word_segments = self._update_word_segments(word_segments, refined_segments)
 
-        # Detect speaker name patterns and create mapping
-        speaker_mapping = self._create_speaker_mapping(refined_segments)
+        # Use refined segments directly (removed heuristic speaker name extraction)
+        final_segments = refined_segments
+        final_word_segments = refined_word_segments
 
-        # Apply speaker mapping
-        final_segments = self._apply_speaker_mapping(refined_segments, speaker_mapping)
-        final_word_segments = self._apply_speaker_mapping_to_words(refined_word_segments, speaker_mapping)
-
-        # Get unique speakers after refinement
+        # Get unique speakers
         speakers = sorted(set(seg["speaker"] for seg in final_segments if seg["speaker"]))
 
-        print(f"✓ Refinement complete! Identified speakers: {', '.join(speakers)}")
+        print(f"  Refinement complete! Detected speakers: {', '.join(speakers)}")
         print(f"  Final segments: {len(final_segments)}")
 
         return {
-            "text": result["text"],  # Keep original full text
+            "text": result["text"],
             "segments": final_segments,
             "word_segments": final_word_segments,
             "language": result["language"],
             "speakers": speakers,
             "refinement_applied": True,
-            "speaker_mapping": speaker_mapping
+            "timing": result.get("timing", {})
         }
 
     def _create_smart_chunks(self, segments: List[Dict], max_tokens: int) -> List[List[Dict]]:
@@ -482,11 +521,8 @@ class TranscriptRefiner:
 
     def _refine_chunk(self, segments: List[Dict], custom_prompt: Optional[str] = None) -> List[Dict]:
         """Refine a chunk of segments using Claude API."""
-
-        # Prepare transcript chunk
         transcript_text = self._format_segments_for_llm(segments)
 
-        # Build the refinement prompt
         if custom_prompt:
             system_prompt = custom_prompt
         else:
@@ -506,7 +542,7 @@ class TranscriptRefiner:
                 REFINEMENT RULES:
 
                 1. Speaker assignment and merging:
-                - Use stable, descriptive labels: “Person A”, “Person B”, “Person C”, etc. Assign the same label for the same speaker across all segments in this chunk.
+                - Use stable, descriptive labels: "Person A", "Person B", "Person C", etc. Assign the same label for the same speaker across all segments in this chunk.
                 - If a short segment (1-3 words or ≤1 second duration) labeled as UNKNOWN appears between two consecutive segments from the same speaker, assume it is a continuation of the same person's speech.
                 - In such cases, reassign the UNKNOWN segment's speaker to match the surrounding speaker.
                 - Then MERGE all three (or more) consecutive segments into a single segment.
@@ -524,12 +560,12 @@ class TranscriptRefiner:
 
                 4. Multilingual / Hindi-English:
                 - When text is in Hindi or mixed Hindi-English, translate to clear conversational English.
-                - Preserve cultural/intent nuance (“yaar”, “acha”, “haan”) by using lightweight equivalents (“hey”, “okay”, “yeah”) when needed.
+                - Preserve cultural/intent nuance ("yaar", "acha", "haan") by using lightweight equivalents ("hey", "okay", "yeah") when needed.
                 - If translation is ambiguous, keep the original phrase.
 
                 5. Filler words:
-                - Remove only obvious fillers that don't change meaning (“um”, “uh”, “like” at the start).
-                - Keep hesitations that show intent (“I… I don't know”, “let me think”).
+                - Remove only obvious fillers that don't change meaning ("um", "uh", "like" at the start).
+                - Keep hesitations that show intent ("I… I don't know", "let me think").
 
                 OUTPUT FORMAT:
 
@@ -538,6 +574,7 @@ class TranscriptRefiner:
                 - `start` and `end` MUST be the original numeric values from input unless segments were merged, in which case use the earliest start and latest end of the merged range.
                 - Do NOT wrap the JSON in markdown fences.
                 - Do NOT add explanations, comments, or metadata."""
+
         user_prompt = f"""Refine this transcript chunk:
 
 {transcript_text}
@@ -556,22 +593,17 @@ Do not include any explanation or markdown formatting, just the JSON array."""
                 ]
             )
 
-            # Extract JSON from response
             response_text = response.content[0].text.strip()
 
             # Remove markdown code blocks if present
             if response_text.startswith("```"):
                 lines = response_text.split("\n")
-                # strip ``` or ```json fences
                 if len(lines) >= 2 and lines[-1].strip().startswith("```"):
                     response_text = "\n".join(lines[1:-1])
                 if response_text.strip().lower().startswith("json"):
                     response_text = response_text[4:].strip()
 
-            # Validate JSON
             refined_segments = json.loads(response_text)
-
-            # Fix (#5): robust validation & per-segment fallback
             return self._validate_and_merge_segments(segments, refined_segments)
 
         except Exception as e:
@@ -591,11 +623,7 @@ Do not include any explanation or markdown formatting, just the JSON array."""
         return "\n".join(lines)
 
     def _validate_and_merge_segments(self, original: List[Dict], refined: List[Dict]) -> List[Dict]:
-        """
-        Fix (#5): Validate refined segments and merge safely with original timestamps.
-        - If length mismatch or wrong type: return original.
-        - For each segment, enforce keys and types; fallback per segment if malformed.
-        """
+        """Validate refined segments and merge safely with original timestamps."""
         if not isinstance(refined, list) or len(refined) != len(original):
             print(f"  Warning: Segment count mismatch or non-list; using original")
             return original
@@ -626,10 +654,7 @@ Do not include any explanation or markdown formatting, just the JSON array."""
         return merged
 
     def _update_word_segments(self, word_segments: List[Dict], refined_segments: List[Dict]) -> List[Dict]:
-        """
-        Fix (#4): Update word-level segments using a bisect-based lookup (O(N log M))
-        instead of scanning all segments for each word.
-        """
+        """Update word-level segments using bisect-based lookup."""
         if not refined_segments:
             return word_segments
 
@@ -655,72 +680,9 @@ Do not include any explanation or markdown formatting, just the JSON array."""
 
         return updated_words
 
-    def _create_speaker_mapping(self, segments: List[Dict]) -> Dict[str, str]:
-        """
-        Fix (#6): Create a stable mapping from generic SPEAKER_XX labels to either
-        extracted names ("I am John", "My name is Priya") or deterministic Person A/B/C.
-        """
-        mapping: Dict[str, str] = {}
-        fallback_bucket: Dict[str, str] = {}
-        name_pat = re.compile(
-            r"\b(i am|i'm|this is|my name is)\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)?)\b",
-            re.IGNORECASE
-        )
-
-        next_person_ord = 0
-        def next_person():
-            nonlocal next_person_ord
-            label = f"Person {chr(65 + next_person_ord)}"
-            next_person_ord += 1
-            return label
-
-        for seg in segments:
-            spk = seg.get("speaker")
-            txt = seg.get("text", "") or ""
-            if not spk:
-                continue
-            if spk.startswith("SPEAKER_") or spk.upper() in {"UNKNOWN", "NA", "UNK"}:
-                m = name_pat.search(txt)
-                if m:
-                    candidate = m.group(2).strip()
-                    if spk not in mapping:
-                        mapping[spk] = candidate
-                else:
-                    if spk not in fallback_bucket:
-                        fallback_bucket[spk] = next_person()
-
-        # Merge fallbacks without clobbering extracted names
-        for k, v in fallback_bucket.items():
-            mapping.setdefault(k, v)
-
-        return mapping
-
-    def _apply_speaker_mapping(self, segments: List[Dict], mapping: Dict[str, str]) -> List[Dict]:
-        """Apply speaker name mapping to segments."""
-        if not mapping:
-            return segments
-
-        return [
-            {**seg, "speaker": mapping.get(seg.get("speaker"), seg.get("speaker"))}
-            for seg in segments
-        ]
-
-    def _apply_speaker_mapping_to_words(self, word_segments: List[Dict], mapping: Dict[str, str]) -> List[Dict]:
-        """Apply speaker name mapping to word segments."""
-        if not mapping:
-            return word_segments
-
-        return [
-            {**word, "speaker": mapping.get(word.get("speaker"), word.get("speaker"))}
-            for word in word_segments
-        ]
-
     def _merge_consecutive_segments(self, segments: List[Dict]) -> List[Dict]:
         """
         Merge consecutive segments from the same speaker for better readability.
-
-        This combines multiple short segments from the same speaker into longer,
-        more natural conversational blocks.
         """
         if not segments:
             return []
@@ -737,12 +699,9 @@ Do not include any explanation or markdown formatting, just the JSON array."""
         for segment in segments[1:]:
             speaker = segment.get("speaker")
 
-            # If same speaker, merge the segments
             if speaker == current["speaker"]:
-                # Append text with proper spacing
                 new_text = segment.get("text", "").strip()
                 if current["text"] and new_text:
-                    # Add space between segments unless the previous ends with certain punctuation
                     if current["text"][-1] not in {'.', '!', '?', ':', ';', ','}:
                         current["text"] += " " + new_text
                     else:
@@ -750,13 +709,9 @@ Do not include any explanation or markdown formatting, just the JSON array."""
                 elif new_text:
                     current["text"] = new_text
 
-                # Extend the end time
                 current["end"] = segment.get("end")
-
-                # Merge words if available
                 current["words"].extend(segment.get("words", []))
             else:
-                # Different speaker - save current and start new
                 merged.append(current)
                 current = {
                     "speaker": speaker,
@@ -766,9 +721,7 @@ Do not include any explanation or markdown formatting, just the JSON array."""
                     "words": segment.get("words", [])
                 }
 
-        # Don't forget the last segment
         merged.append(current)
-
         return merged
 
 
@@ -780,58 +733,20 @@ def format_timestamp(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:06.3f}"
 
 
-def _wrap_srt(text: str, width: int = 42, max_lines: int = 2) -> str:
-    """
-    Fix (#7): Soft-wrap SRT text to improve readability (≈42 chars/line, max 2 lines).
-    """
-    words = text.split()
-    lines, cur = [], ""
-    for w in words:
-        if not cur:
-            cur = w
-        elif len(cur) + 1 + len(w) <= width:
-            cur += " " + w
-        else:
-            lines.append(cur)
-            cur = w
-        if len(lines) >= max_lines:
-            break
-    if len(lines) < max_lines and cur:
-        lines.append(cur)
-    return "\n".join(lines[:max_lines])
-
-
-def _chars_per_sec(text: str, start: float, end: float) -> Optional[float]:
-    dur = max(0.0, end - start)
-    if dur <= 0:
-        return None
-    return len(text.replace("\n", " ")) / dur
-
-
 def save_results(result: Dict, output_path: str, format: str = "all", suffix: str = ""):
-    """
-    Save transcription results in various formats.
-
-    Args:
-        result: Output from WhisperDiarization.transcribe()
-        output_path: Base path for output files (without extension)
-        format: Output format ('txt', 'json', 'srt', 'all')
-        suffix: Optional suffix to add to filename (e.g., '_refined')
-
-    Fix (#7): wrap SRT lines for readability.
-    """
+    """Save transcription results in various formats."""
     output_base = Path(output_path)
     if suffix:
         output_base = output_base.parent / f"{output_base.stem}{suffix}"
 
-    # JSON format (complete data)
+    # JSON format
     if format in ["json", "all"]:
         json_path = output_base.with_suffix(".json")
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(result, f, indent=2, ensure_ascii=False)
         print(f"Saved JSON: {json_path}")
 
-    # TXT format (speaker labels + text)
+    # TXT format
     if format in ["txt", "all"]:
         txt_path = output_base.with_suffix(".txt")
         with open(txt_path, "w", encoding="utf-8") as f:
@@ -840,7 +755,7 @@ def save_results(result: Dict, output_path: str, format: str = "all", suffix: st
                 f.write(f"[{speaker}] {segment['text'].strip()}\n")
         print(f"Saved TXT: {txt_path}")
 
-    # SRT format (subtitles with speakers)
+    # SRT format
     if format in ["srt", "all"]:
         srt_path = output_base.with_suffix(".srt")
         with open(srt_path, "w", encoding="utf-8") as f:
@@ -849,7 +764,6 @@ def save_results(result: Dict, output_path: str, format: str = "all", suffix: st
                 start = format_timestamp(segment["start"]).replace(".", ",")
                 end = format_timestamp(segment["end"]).replace(".", ",")
                 text = f"[{speaker}] {segment['text'].strip()}"
-                # text = _wrap_srt(text)  # DISABLED: Keep natural flow without line breaks
 
                 f.write(f"{i}\n")
                 f.write(f"{start} --> {end}\n")
@@ -858,167 +772,66 @@ def save_results(result: Dict, output_path: str, format: str = "all", suffix: st
 
 
 def main():
-    """Command-line interface for Whisper + Diarization"""
+    """Command-line interface for Parallel Whisper + Diarization"""
     parser = argparse.ArgumentParser(
-        description="Transcribe audio with speaker diarization using Whisper + pyannote",
+        description="Parallel transcription with Whisper + Pyannote speaker diarization",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
 
-    # Required arguments
-    parser.add_argument(
-        "audio",
-        type=str,
-        help="Path to audio file"
-    )
+    parser.add_argument("audio", type=str, help="Path to audio file")
 
-    # Model arguments
-    parser.add_argument(
-        "--whisper-model",
-        type=str,
-        default="turbo",
-        choices=["tiny", "base", "small", "medium", "large", "large-v2", "large-v3", "turbo"],
-        help="Whisper model size"
-    )
-
-    parser.add_argument(
-        "--diarization-model",
-        type=str,
-        default="pyannote/speaker-diarization-3.1",
-        help="HuggingFace diarization model"
-    )
-
-    parser.add_argument(
-        "--hf-token",
-        type=str,
-        default=None,
-        help="HuggingFace token for pyannote models"
-    )
-
-    # Transcription arguments
-    parser.add_argument(
-        "--language",
-        type=str,
-        default=None,
-        help="Language code (e.g., 'en', 'es', 'fr') or None for auto-detect"
-    )
-
-    # Speaker arguments
-    parser.add_argument(
-        "--num-speakers",
-        type=int,
-        default=None,
-        help="Exact number of speakers (if known)"
-    )
-
-    parser.add_argument(
-        "--min-speakers",
-        type=int,
-        default=None,
-        help="Minimum number of speakers"
-    )
-
-    parser.add_argument(
-        "--max-speakers",
-        type=int,
-        default=None,
-        help="Maximum number of speakers"
-    )
-
-    parser.add_argument(
-        "--multilingual",
-        action="store_true",
-        help="Enable multilingual/code-switching mode (e.g., English-Hindi mixing)"
-    )
-
-    # LLM Refinement arguments
-    parser.add_argument(
-        "--refine-with-llm",
-        action="store_true",
-        default=True,
-        help="Enable LLM-based transcript refinement using Claude via Vertex AI (default: enabled)"
-    )
-
-    parser.add_argument(
-        "--no-refine",
-        action="store_true",
-        help="Disable LLM refinement (skip the refinement step)"
-    )
-
-    parser.add_argument(
-        "--vertex-project-id",
-        type=str,
-        default=None,
-        help="Google Cloud project ID for Vertex AI (uses ANTHROPIC_VERTEX_PROJECT_ID env var if not provided)"
-    )
-
-    parser.add_argument(
-        "--vertex-region",
-        type=str,
-        default="us-east5",
-        help="Vertex AI region (default: us-east5)"
-    )
-
-    parser.add_argument(
-        "--claude-model",
-        type=str,
-        default="claude-3-5-sonnet-v2@20241022",
-        help="Claude model to use for refinement via Vertex AI"
-    )
-
-    parser.add_argument(
-        "--refinement-prompt",
-        type=str,
-        default=None,
-        help="Custom prompt for LLM refinement (uses default if not provided)"
-    )
-
-    parser.add_argument(
-        "--max-tokens",
-        type=int,
-        default=200000,
-        help="Maximum tokens per LLM chunk (default: 200k for ~256k context window)"
-    )
-
-    # Output arguments
-    parser.add_argument(
-        "--output",
-        "-o",
-        type=str,
-        default=None,
-        help="Output file path (without extension)"
-    )
-
-    parser.add_argument(
-        "--format",
-        "-f",
-        type=str,
-        default="all",
-        choices=["txt", "json", "srt", "all"],
-        help="Output format"
-    )
-
-    parser.add_argument(
-        "--device",
-        type=str,
-        default=None,
-        choices=["cuda", "cpu"],
-        help="Device to use for inference"
-    )
+    parser.add_argument("--whisper-model", type=str, default="turbo",
+                        choices=["tiny", "base", "small", "medium", "large", "large-v2", "large-v3", "turbo"],
+                        help="Whisper model size")
+    parser.add_argument("--diarization-model", type=str, default="pyannote/speaker-diarization-3.1",
+                        help="HuggingFace diarization model")
+    parser.add_argument("--hf-token", type=str, default=None,
+                        help="HuggingFace token for pyannote models")
+    parser.add_argument("--language", type=str, default=None,
+                        help="Language code (e.g., 'en', 'es', 'fr') or None for auto-detect")
+    parser.add_argument("--num-speakers", type=int, default=None,
+                        help="Exact number of speakers (if known)")
+    parser.add_argument("--min-speakers", type=int, default=None,
+                        help="Minimum number of speakers")
+    parser.add_argument("--max-speakers", type=int, default=None,
+                        help="Maximum number of speakers")
+    parser.add_argument("--multilingual", action="store_true",
+                        help="Enable multilingual/code-switching mode")
+    parser.add_argument("--refine-with-llm", action="store_true", default=True,
+                        help="Enable LLM-based transcript refinement (default: enabled)")
+    parser.add_argument("--no-refine", action="store_true",
+                        help="Disable LLM refinement")
+    parser.add_argument("--vertex-project-id", type=str, default=None,
+                        help="Google Cloud project ID for Vertex AI")
+    parser.add_argument("--vertex-region", type=str, default="us-east5",
+                        help="Vertex AI region")
+    parser.add_argument("--claude-model", type=str, default="claude-3-5-sonnet-v2@20241022",
+                        help="Claude model for refinement")
+    parser.add_argument("--refinement-prompt", type=str, default=None,
+                        help="Custom prompt for LLM refinement")
+    parser.add_argument("--chunk-size", type=int, default=20,
+                        help="Number of segments to process at once during LLM refinement")
+    parser.add_argument("--output", "-o", type=str, default=None,
+                        help="Output file path (without extension)")
+    parser.add_argument("--format", "-f", type=str, default="all",
+                        choices=["txt", "json", "srt", "all"],
+                        help="Output format")
+    parser.add_argument("--device", type=str, default=None,
+                        choices=["cuda", "cpu"],
+                        help="Device to use for inference")
 
     args = parser.parse_args()
 
-    # Handle --no-refine flag
     if args.no_refine:
         args.refine_with_llm = False
 
-    # Check if audio file exists
     if not os.path.exists(args.audio):
         print(f"Error: Audio file not found: {args.audio}")
         return
 
     # Initialize pipeline
     try:
-        pipeline = WhisperDiarization(
+        pipeline = ParallelWhisperDiarization(
             whisper_model=args.whisper_model,
             diarization_model=args.diarization_model,
             device=args.device,
@@ -1028,7 +841,7 @@ def main():
         print(f"\nError initializing pipeline: {e}")
         return
 
-    # Transcribe
+    # Transcribe with parallel processing
     result = pipeline.transcribe(
         args.audio,
         language=args.language,
@@ -1048,7 +861,7 @@ def main():
     # Save raw results
     save_results(result, output_path, args.format, suffix="_raw" if args.refine_with_llm else "")
 
-    # Apply LLM refinement if requested (Vertex creds behavior intentionally unchanged)
+    # Apply LLM refinement if requested
     if args.refine_with_llm:
         try:
             refiner = TranscriptRefiner(
@@ -1059,22 +872,16 @@ def main():
 
             refined_result = refiner.refine_transcript(
                 result,
-                max_tokens=args.max_tokens,
+                chunk_size=args.chunk_size,
                 custom_prompt=args.refinement_prompt
             )
 
-            # Save refined results
             save_results(refined_result, output_path, args.format, suffix="_refined")
-
-            # Use refined result for summary display
             result = refined_result
 
         except Exception as e:
             print(f"\nError during LLM refinement: {e}")
             print("Continuing with raw transcript only...")
-    else:
-        # Save results without suffix if no refinement
-        pass
 
     # Print summary
     print("\n" + "="*60)
@@ -1084,6 +891,21 @@ def main():
     print(f"Speakers detected: {len(result['speakers'])}")
     print(f"Speakers: {', '.join(result['speakers'])}")
     print(f"\nSegments: {len(result['segments'])}")
+
+    # Print timing information
+    if 'timing' in result:
+        timing = result['timing']
+        print(f"\n{'='*60}")
+        print("PERFORMANCE METRICS")
+        print(f"{'='*60}")
+        print(f"Whisper time:       {timing['whisper_time']:.2f}s")
+        print(f"Pyannote time:      {timing['diarization_time']:.2f}s")
+        print(f"Sequential would:   {timing['whisper_time'] + timing['diarization_time']:.2f}s")
+        print(f"Parallel actual:    {timing['parallel_time']:.2f}s")
+        print(f"Time saved:         {timing['time_saved']:.2f}s ({timing['time_saved']/(timing['whisper_time'] + timing['diarization_time'])*100:.1f}%)")
+        print(f"Merge time:         {timing['merge_time']:.2f}s")
+        print(f"Total time:         {timing['total_time']:.2f}s")
+
     print("\nFirst few segments:")
     for i, seg in enumerate(result['segments'][:5], 1):
         speaker = seg['speaker'] or 'UNKNOWN'
