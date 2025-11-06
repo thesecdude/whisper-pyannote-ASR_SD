@@ -1,11 +1,4 @@
 #!/usr/bin/env python3
-"""
-Standalone Pyannote diarization benchmark - CPU only.
-Optimized for multi-core CPUs (e.g., 24 cores).
-Only runs speaker diarization.
-No transcription, no merging, no LLM processing, no GPU.
-"""
-
 import argparse
 import json
 import time
@@ -18,12 +11,6 @@ from pyannote.audio import Pipeline
 
 
 def set_cpu_threads(num_threads: Optional[int] = None):
-    """
-    Configure CPU thread usage for optimal performance.
-
-    Args:
-        num_threads: Number of threads to use. If None, use all available cores.
-    """
     if num_threads is None:
         import multiprocessing
         num_threads = multiprocessing.cpu_count()
@@ -52,22 +39,6 @@ def benchmark_pyannote_cpu(
     num_threads: Optional[int] = None,
     output: Optional[str] = None
 ) -> Dict:
-    """
-    Run Pyannote speaker diarization on CPU only.
-
-    Args:
-        audio_path: Path to audio file
-        diarization_model: HuggingFace model for diarization
-        hf_token: HuggingFace token
-        num_speakers: Exact number of speakers (if known)
-        min_speakers: Minimum number of speakers
-        max_speakers: Maximum number of speakers
-        num_threads: Number of CPU threads (None for all cores)
-        output: Optional output path for results
-
-    Returns:
-        Dictionary with diarization results and timing
-    """
     import multiprocessing
     total_cores = multiprocessing.cpu_count()
 
@@ -97,8 +68,6 @@ def benchmark_pyannote_cpu(
         except Exception as e:
             print("\nError: Pyannote models require HuggingFace authentication.")
             print("Please provide a HuggingFace token using --hf-token")
-            print("Get your token from: https://huggingface.co/settings/tokens")
-            print("Accept model terms at: https://huggingface.co/pyannote/speaker-diarization-3.1")
             raise e
 
     # Move to CPU (ensure no GPU usage)
@@ -207,23 +176,6 @@ def main():
     parser = argparse.ArgumentParser(
         description="Benchmark Pyannote speaker diarization on CPU (no GPU, standalone)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Benchmark with all CPU cores (auto-detect)
-  python benchmark_pyannote_cpu.py audio.mp3 --hf-token YOUR_TOKEN
-
-  # Benchmark with specific number of threads
-  python benchmark_pyannote_cpu.py audio.mp3 --hf-token YOUR_TOKEN --threads 16
-
-  # Benchmark with known number of speakers
-  python benchmark_pyannote_cpu.py audio.mp3 --hf-token YOUR_TOKEN --num-speakers 3 --threads 24
-
-  # Save results
-  python benchmark_pyannote_cpu.py audio.mp3 --hf-token YOUR_TOKEN --output results/pyannote_cpu_bench.json
-
-  # Specify speaker range
-  python benchmark_pyannote_cpu.py audio.mp3 --hf-token YOUR_TOKEN --min-speakers 2 --max-speakers 5 --threads 12
-"""
     )
 
     parser.add_argument(

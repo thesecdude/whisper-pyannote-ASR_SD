@@ -18,20 +18,6 @@ def benchmark_pyannote(
     device: Optional[str] = None,
     output: Optional[str] = None
 ) -> Dict:
-    """
-    Run Pyannote speaker diarization only.
-    Args:
-        audio_path: Path to audio file
-        diarization_model: HuggingFace model for diarization
-        hf_token: HuggingFace token
-        num_speakers: Exact number of speakers (if known)
-        min_speakers: Minimum number of speakers
-        max_speakers: Maximum number of speakers
-        device: Device to use ('cuda', 'cpu', or None for auto-detect)
-        output: Optional output path for results
-    Returns:
-        Dictionary with diarization results and timing
-    """
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -158,22 +144,8 @@ def benchmark_pyannote(
 def main():
     parser = argparse.ArgumentParser(
         description="Benchmark Pyannote speaker diarization (standalone, no transcription)",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Benchmark with default model
-  python benchmark_pyannote.py audio.mp3 --hf-token YOUR_TOKEN
-
-  # Benchmark with known number of speakers
-  python benchmark_pyannote.py audio.mp3 --hf-token YOUR_TOKEN --num-speakers 3
-
-  # Save results
-  python benchmark_pyannote.py audio.mp3 --hf-token YOUR_TOKEN --output results/pyannote_benchmark.json
-
-  # Specify speaker range
-  python benchmark_pyannote.py audio.mp3 --hf-token YOUR_TOKEN --min-speakers 2 --max-speakers 5
-"""
-    )
+        formatter_class=argparse.RawDescriptionHelpFormatter
+        )
 
     parser.add_argument(
         'audio',

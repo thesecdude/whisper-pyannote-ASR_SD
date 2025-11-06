@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-"""
-Standalone Whisper transcription benchmark.
-Only runs Whisper transcription with word-level timestamps.
-No diarization, no merging, no LLM processing.
-"""
 
 import argparse
 import json
@@ -23,20 +18,6 @@ def benchmark_whisper(
     output: Optional[str] = None,
     **whisper_kwargs
 ) -> Dict:
-    """
-    Run Whisper transcription only.
-
-    Args:
-        audio_path: Path to audio file
-        whisper_model: Whisper model name
-        language: Language code or None for auto-detect
-        device: Device to use ('cuda', 'cpu', or None for auto-detect)
-        output: Optional output path for results
-        **whisper_kwargs: Additional Whisper arguments
-
-    Returns:
-        Dictionary with transcription results and timing
-    """
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -128,20 +109,6 @@ def main():
     parser = argparse.ArgumentParser(
         description="Benchmark Whisper transcription (standalone, no diarization)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Benchmark with default model (turbo)
-  python benchmark_whisper.py audio.mp3
-
-  # Benchmark with specific model
-  python benchmark_whisper.py audio.mp3 --model large-v3
-
-  # Save results
-  python benchmark_whisper.py audio.mp3 --output results/whisper_benchmark.json
-
-  # Specify language
-  python benchmark_whisper.py audio.mp3 --language en
-"""
     )
 
     parser.add_argument(

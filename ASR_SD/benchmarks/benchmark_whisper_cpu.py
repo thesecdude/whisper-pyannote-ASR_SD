@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-"""
-Standalone Whisper transcription benchmark - CPU only.
-Optimized for multi-core CPUs (e.g., 24 cores).
-Only runs Whisper transcription with word-level timestamps.
-No diarization, no merging, no LLM processing, no GPU.
-"""
 
 import argparse
 import json
@@ -18,12 +12,6 @@ import whisper
 
 
 def set_cpu_threads(num_threads: Optional[int] = None):
-    """
-    Configure CPU thread usage for optimal performance.
-
-    Args:
-        num_threads: Number of threads to use. If None, use all available cores.
-    """
     if num_threads is None:
         import multiprocessing
         num_threads = multiprocessing.cpu_count()
@@ -50,20 +38,6 @@ def benchmark_whisper_cpu(
     output: Optional[str] = None,
     **whisper_kwargs
 ) -> Dict:
-    """
-    Run Whisper transcription on CPU only.
-
-    Args:
-        audio_path: Path to audio file
-        whisper_model: Whisper model name
-        language: Language code or None for auto-detect
-        num_threads: Number of CPU threads (None for all cores)
-        output: Optional output path for results
-        **whisper_kwargs: Additional Whisper arguments
-
-    Returns:
-        Dictionary with transcription results and timing
-    """
     import multiprocessing
     total_cores = multiprocessing.cpu_count()
 
@@ -165,24 +139,7 @@ def benchmark_whisper_cpu(
 def main():
     parser = argparse.ArgumentParser(
         description="Benchmark Whisper transcription on CPU (no GPU, standalone)",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Benchmark with all CPU cores (auto-detect)
-  python benchmark_whisper_cpu.py audio.mp3
-
-  # Benchmark with specific number of threads
-  python benchmark_whisper_cpu.py audio.mp3 --threads 16
-
-  # Benchmark with specific model
-  python benchmark_whisper_cpu.py audio.mp3 --model large-v3 --threads 24
-
-  # Save results
-  python benchmark_whisper_cpu.py audio.mp3 --output results/whisper_cpu_bench.json
-
-  # Specify language
-  python benchmark_whisper_cpu.py audio.mp3 --language en --threads 12
-"""
+        formatter_class=argparse.RawDescriptionHelpFormatter
     )
 
     parser.add_argument(

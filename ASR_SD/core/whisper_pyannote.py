@@ -21,13 +21,7 @@ except ImportError:
 
 
 class WhisperDiarization:
-    """
-    Combines Whisper transcription with pyannote speaker diarization.
-    This class handles:
-    1. Audio transcription with word-level timestamps (Whisper)
-    2. Speaker diarization (pyannote.audio)
-    3. Alignment of speakers to transcribed words
-    """
+    """Combines Whisper transcription with pyannote speaker diarization."""
 
     def __init__(
         self,
@@ -36,16 +30,6 @@ class WhisperDiarization:
         device: Optional[str] = None,
         hf_token: Optional[str] = None,
     ):
-        """
-        Initialize the Whisper + Diarization pipeline.
-        Args:
-            whisper_model: Whisper model name (tiny, base, small, medium, large, large-v2, large-v3, turbo*)
-                           *'turbo' is valid only if your repo/fork exposes it.
-            diarization_model: HuggingFace model for diarization
-            device: Device to use ('cuda', 'cpu', or None for auto-detect)
-            hf_token: HuggingFace token for accessing pyannote models
-                     (get from: https://huggingface.co/settings/tokens)
-        """
         if device is None:
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
         else:
@@ -90,26 +74,6 @@ class WhisperDiarization:
         multilingual: bool = True,
         **whisper_kwargs
     ) -> Dict:
-        """
-        Transcribe audio with speaker diarization.
-
-        Args:
-            audio_path: Path to audio file
-            language: Language code (e.g., 'en', 'es', 'fr') or None for auto-detect
-            num_speakers: Exact number of speakers (if known)
-            min_speakers: Minimum number of speakers
-            max_speakers: Maximum number of speakers
-            multilingual: If True, allows language mixing (code-switching) in the audio
-            **whisper_kwargs: Additional arguments for Whisper transcribe()
-
-        Returns:
-            Dictionary containing:
-                - 'text': Full transcription
-                - 'segments': List of segments with speaker labels
-                - 'word_segments': List of individual words with speakers and timestamps
-                - 'language': Detected/specified language (or 'mixed' for multilingual)
-                - 'speakers': List of unique speakers
-        """
         print(f"\nProcessing: {audio_path}")
 
         # Step 1: Transcribe with Whisper (with word timestamps)
@@ -157,16 +121,6 @@ class WhisperDiarization:
         whisper_result: Dict,
         diarization: Annotation
     ) -> Dict:
-        """
-        Align speaker diarization with Whisper word timestamps.
-
-        Args:
-            whisper_result: Output from Whisper transcribe()
-            diarization: Pyannote Annotation object
-
-        Returns:
-            Aligned result with speaker labels
-        """
         # Extract words with timestamps from Whisper result
         word_segments = []
 
@@ -221,19 +175,6 @@ class WhisperDiarization:
         diarization: Annotation,
         timestamp: float
     ) -> Optional[str]:
-        """
-        Get the speaker active at a specific timestamp.
-
-        Args:
-            diarization: Pyannote Annotation
-            timestamp: Time in seconds
-
-        Returns:
-            Speaker label or None if no speaker at that time
-
-        Fix (#3): when multiple segments cover the same instant, pick the one
-        whose center is closest to the timestamp (more stable than first-match).
-        """
         best_speaker = None
         best_dist = None
         for segment, _, speaker in diarization.itertracks(yield_label=True):
@@ -246,9 +187,6 @@ class WhisperDiarization:
         return best_speaker
 
     def _smart_join(self, prev_text: str, token: str) -> str:
-        """
-        Fix (#2): smart spacing around punctuation when joining tokens into segment text.
-        """
         if not prev_text:
             return token
 
@@ -271,11 +209,6 @@ class WhisperDiarization:
         return prev_text + " " + token
 
     def _group_by_speaker(self, word_segments: List[Dict]) -> List[Dict]:
-        """
-        Group consecutive words by the same speaker into segments.
-
-        Fix (#2): build readable text with correct spaces around punctuation.
-        """
         if not word_segments:
             return []
 
@@ -308,13 +241,7 @@ class WhisperDiarization:
 
 
 class TranscriptRefiner:
-    """
-    Uses Claude API to refine transcripts by:
-    - Improving speaker identification using pattern matching
-    - Fixing spelling and grammatical errors
-    - Adding proper punctuation
-    - Translating Hindi/mixed language to English while preserving context
-    """
+    """Uses Claude API to refine transcripts."""
 
     def __init__(
         self,
@@ -322,14 +249,6 @@ class TranscriptRefiner:
         region: str = "us-east5",
         model: str = "claude-3-5-sonnet-v2@20241022"
     ):
-        """
-        Initialize the transcript refiner using Vertex AI.
-
-        Args:
-            project_id: Google Cloud project ID (uses ANTHROPIC_VERTEX_PROJECT_ID env var if not provided)
-            region: Vertex AI region (default: us-east5)
-            model: Claude model to use via Vertex AI
-        """
         if not ANTHROPIC_AVAILABLE:
             raise ImportError("anthropic package not installed. Install with: pip install anthropic")
 
@@ -355,17 +274,6 @@ class TranscriptRefiner:
         max_tokens: int = 200000,
         custom_prompt: Optional[str] = None
     ) -> Dict:
-        """
-        Refine the entire transcript using Claude API.
-
-        Args:
-            result: Output from WhisperDiarization.transcribe()
-            max_tokens: Maximum tokens per chunk (default: 200k for ~256k context window)
-            custom_prompt: Optional custom refinement instructions
-
-        Returns:
-            Refined result with improved speaker labels and text
-        """
         print("\nStep 4/4: Refining transcript with Claude...")
 
         segments = result["segments"]
@@ -414,19 +322,6 @@ class TranscriptRefiner:
         }
 
     def _create_smart_chunks(self, segments: List[Dict], max_tokens: int) -> List[List[Dict]]:
-        """
-        Create chunks that fit within token limit without splitting speaker segments.
-
-        Uses approximate token counting (4 chars ≈ 1 token) and ensures no speaker
-        segment is ever cut in the middle.
-
-        Args:
-            segments: List of merged speaker segments
-            max_tokens: Maximum tokens per chunk
-
-        Returns:
-            List of segment chunks, each fitting within max_tokens
-        """
         chunks = []
         current_chunk = []
         current_tokens = 0
@@ -566,11 +461,6 @@ Do not include any explanation or markdown formatting, just the JSON array."""
         return "\n".join(lines)
 
     def _validate_and_merge_segments(self, original: List[Dict], refined: List[Dict]) -> List[Dict]:
-        """
-        Fix (#5): Validate refined segments and merge safely with original timestamps.
-        - If length mismatch or wrong type: return original.
-        - For each segment, enforce keys and types; fallback per segment if malformed.
-        """
         if not isinstance(refined, list) or len(refined) != len(original):
             print(f"  Warning: Segment count mismatch or non-list; using original")
             return original
@@ -601,10 +491,6 @@ Do not include any explanation or markdown formatting, just the JSON array."""
         return merged
 
     def _update_word_segments(self, word_segments: List[Dict], refined_segments: List[Dict]) -> List[Dict]:
-        """
-        Fix (#4): Update word-level segments using a bisect-based lookup (O(N log M))
-        instead of scanning all segments for each word.
-        """
         if not refined_segments:
             return word_segments
 
@@ -631,9 +517,6 @@ Do not include any explanation or markdown formatting, just the JSON array."""
         return updated_words
 
     def _merge_consecutive_segments(self, segments: List[Dict]) -> List[Dict]:
-        """
-        Merge consecutive segments from the same speaker for better readability.
-        """
         if not segments:
             return []
 
@@ -693,17 +576,6 @@ def format_timestamp(seconds: float) -> str:
 
 
 def save_results(result: Dict, output_path: str, format: str = "all", suffix: str = ""):
-    """
-    Save transcription results in various formats.
-
-    Args:
-        result: Output from WhisperDiarization.transcribe()
-        output_path: Base path for output files (without extension)
-        format: Output format ('txt', 'json', 'srt', 'all')
-        suffix: Optional suffix to add to filename (e.g., '_refined')
-
-    Fix (#7): wrap SRT lines for readability.
-    """
     output_base = Path(output_path)
     if suffix:
         output_base = output_base.parent / f"{output_base.stem}{suffix}"

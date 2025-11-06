@@ -1,11 +1,4 @@
 #!/usr/bin/env python3
-"""
-Merge consecutive segments from the same speaker in JSON transcripts.
-When a speaker has multiple consecutive segments, merge them into one with:
-- Combined text
-- Start time from first segment
-- End time from last segment
-"""
 
 import argparse
 import json
@@ -14,15 +7,6 @@ from pathlib import Path
 
 
 def merge_consecutive_speakers(segments):
-    """
-    Merge consecutive segments from the same speaker.
-
-    Args:
-        segments: List of segment dictionaries with 'speaker', 'start', 'end', 'text'
-
-    Returns:
-        List of merged segments
-    """
     if not segments:
         return []
 
@@ -63,16 +47,6 @@ def merge_consecutive_speakers(segments):
 
 
 def merge_json_file(input_path, output_path=None):
-    """
-    Process a JSON transcript file and merge consecutive speaker segments.
-
-    Args:
-        input_path: Path to input JSON file
-        output_path: Path to output JSON file (optional, defaults to input_merged.json)
-
-    Returns:
-        Dictionary with merge statistics
-    """
     input_path = Path(input_path)
 
     if output_path is None:
@@ -122,18 +96,7 @@ def merge_json_file(input_path, output_path=None):
 def main():
     parser = argparse.ArgumentParser(
         description="Merge consecutive segments from the same speaker in JSON transcripts",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Merge segments in a JSON file
-  python merge_json_segments.py transcript.json
-
-  # Specify output file
-  python merge_json_segments.py transcript.json -o merged_output.json
-
-  # Process multiple files
-  python merge_json_segments.py file1.json file2.json file3.json
-"""
+        formatter_class=argparse.RawDescriptionHelpFormatter,       
     )
 
     parser.add_argument(

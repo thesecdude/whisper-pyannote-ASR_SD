@@ -1,34 +1,22 @@
 #!/usr/bin/env python3
-"""
-Refine an existing transcript JSON file using LLM without re-running Whisper+pyannote.
-
-Usage:
-    python refine_existing.py input.json --output refined_output
-
-This takes a raw transcript JSON (from whisper_diarization.py) and applies
-LLM refinement to it, saving the refined version without redoing transcription.
-"""
+"""Refine an existing transcript JSON file using LLM without re-running Whisper+pyannote."""
 
 import argparse
 import json
 import os
 import sys
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict
 
-# Import the TranscriptRefiner class from whisper_pyannote (which has the better prompt)
+# Add parent directory to path to import from ASR_SD/core
+sys.path.insert(0, str(Path(__file__).parent.parent / 'core'))
+
 try:
-    # Try importing from whisper_pyannote first (newer version)
     from whisper_pyannote import TranscriptRefiner, save_results
-    print("Using TranscriptRefiner from whisper_pyannote.py (improved version)")
-except ImportError:
-    # Fall back to whisper_diarization
-    try:
-        from whisper_diarization import TranscriptRefiner, save_results
-        print("Using TranscriptRefiner from whisper_diarization.py")
-    except ImportError:
-        print("Error: Could not import TranscriptRefiner. Make sure whisper_pyannote.py or whisper_diarization.py is in the same directory.")
-        sys.exit(1)
+except ImportError as e:
+    print(f"Error: Could not import from whisper_pyannote.py: {e}")
+    print("Make sure ASR_SD/core/whisper_pyannote.py exists.")
+    sys.exit(1)
 
 
 def load_transcript(json_path: str) -> Dict:
@@ -187,11 +175,6 @@ def main():
     print("="*60)
     print(f"Speakers identified: {', '.join(refined_result['speakers'])}")
     print(f"Total segments: {len(refined_result['segments'])}")
-
-    if refined_result.get('speaker_mapping'):
-        print("\nSpeaker mappings applied:")
-        for old, new in refined_result['speaker_mapping'].items():
-            print(f"  {old} → {new}")
 
     print(f"\nOutput files:")
     output_base = Path(output_path)

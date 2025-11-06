@@ -1,8 +1,4 @@
 #!/usr/bin/env python3
-"""
-Merge consecutive SRT segments from the same speaker into single segments.
-This creates monologues and improves readability by combining speaker turns.
-"""
 
 import re
 import sys
@@ -72,12 +68,6 @@ def parse_segment(segment_lines):
 
 
 def merge_consecutive_speakers(segments, skip_unknown=True):
-    """Merge consecutive segments from the same speaker.
-
-    Args:
-        segments: List of segment lines
-        skip_unknown: If True, skip [UNKNOWN] segments and merge around them
-    """
     if not segments:
         return []
 

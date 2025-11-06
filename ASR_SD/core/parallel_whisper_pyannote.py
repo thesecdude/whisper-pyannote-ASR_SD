@@ -1,7 +1,6 @@
 import argparse
 import json
 import os
-import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import timedelta
@@ -22,13 +21,6 @@ except ImportError:
 
 
 class ParallelWhisperDiarization:
-    """
-    Parallel processing of Whisper transcription and Pyannote diarization.
-    This class:
-    1. Runs Whisper and Pyannote concurrently on the same audio
-    2. Merges results deterministically using timestamp alignment
-    3. Optionally refines with LLM
-    """
 
     def __init__(
         self,
@@ -36,15 +28,7 @@ class ParallelWhisperDiarization:
         diarization_model: str = "pyannote/speaker-diarization-3.1",
         device: Optional[str] = None,
         hf_token: Optional[str] = None,
-    ):
-        """
-        Initialize the parallel pipeline.
-        Args:
-            whisper_model: Whisper model name (tiny, base, small, medium, large, large-v2, large-v3, turbo)
-            diarization_model: HuggingFace model for diarization
-            device: Device to use ('cuda', 'cpu', or None for auto-detect)
-            hf_token: HuggingFace token for accessing pyannote models
-        """
+    ):       
         if device is None:
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
         else:
@@ -87,26 +71,7 @@ class ParallelWhisperDiarization:
         max_speakers: Optional[int] = None,
         multilingual: bool = False,
         **whisper_kwargs
-    ) -> Dict:
-        """
-        Transcribe audio with speaker diarization using parallel processing.
-        Args:
-            audio_path: Path to audio file
-            language: Language code (e.g., 'en', 'es', 'fr') or None for auto-detect
-            num_speakers: Exact number of speakers (if known)
-            min_speakers: Minimum number of speakers
-            max_speakers: Maximum number of speakers
-            multilingual: If True, allows language mixing (code-switching)
-            **whisper_kwargs: Additional arguments for Whisper transcribe()
-        Returns:
-            Dictionary containing:
-                - 'text': Full transcription
-                - 'segments': List of segments with speaker labels
-                - 'word_segments': List of individual words with speakers and timestamps
-                - 'language': Detected/specified language
-                - 'speakers': List of unique speakers
-                - 'timing': Processing time breakdown
-        """
+    ) -> Dict:       
         print(f"\n{'='*60}")
         print(f"PARALLEL PROCESSING: {audio_path}")
         print(f"{'='*60}")
@@ -237,18 +202,7 @@ class ParallelWhisperDiarization:
         self,
         whisper_result: Dict,
         diarization: Annotation
-    ) -> Dict:
-        """
-        Deterministically merge Whisper transcription with Pyannote diarization.
-        Uses timestamp-based alignment:
-        - For each word from Whisper, find the speaker active at that time from Pyannote
-        - Groups consecutive words by speaker into segments
-        Args:
-            whisper_result: Output from Whisper transcribe()
-            diarization: Pyannote Annotation object
-        Returns:
-            Merged result with speaker labels aligned to words
-        """
+    ) -> Dict:        
         # Extract words with timestamps from Whisper result
         word_segments = []
 
@@ -302,17 +256,7 @@ class ParallelWhisperDiarization:
         self,
         diarization: Annotation,
         timestamp: float
-    ) -> Optional[str]:
-        """
-        Get the speaker active at a specific timestamp (deterministic).
-        When multiple speakers overlap, chooses the one whose segment center
-        is closest to the timestamp for stability.
-        Args:
-            diarization: Pyannote Annotation
-            timestamp: Time in seconds
-        Returns:
-            Speaker label or None if no speaker at that time
-        """
+    ) -> Optional[str]:        
         best_speaker = None
         best_dist = None
 
@@ -351,11 +295,7 @@ class ParallelWhisperDiarization:
         # Default: add a space
         return prev_text + " " + token
 
-    def _group_by_speaker(self, word_segments: List[Dict]) -> List[Dict]:
-        """
-        Group consecutive words by the same speaker into segments.
-        Uses smart spacing for proper punctuation handling.
-        """
+    def _group_by_speaker(self, word_segments: List[Dict]) -> List[Dict]:       
         if not word_segments:
             return []
 
@@ -474,20 +414,7 @@ class TranscriptRefiner:
             "timing": result.get("timing", {})
         }
 
-    def _create_smart_chunks(self, segments: List[Dict], max_tokens: int) -> List[List[Dict]]:
-        """
-        Create chunks that fit within token limit without splitting speaker segments.
-
-        Uses approximate token counting (4 chars ≈ 1 token) and ensures no speaker
-        segment is ever cut in the middle.
-
-        Args:
-            segments: List of merged speaker segments
-            max_tokens: Maximum tokens per chunk
-
-        Returns:
-            List of segment chunks, each fitting within max_tokens
-        """
+    def _create_smart_chunks(self, segments: List[Dict], max_tokens: int) -> List[List[Dict]]:      
         chunks = []
         current_chunk = []
         current_tokens = 0
