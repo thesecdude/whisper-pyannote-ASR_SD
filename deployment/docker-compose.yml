@@ -1,0 +1,62 @@
+version: '3.8'
+
+services:
+  whisper:
+    build:
+      context: ..
+      dockerfile: deployment/Dockerfile
+    image: whisper:latest
+    container_name: whisper
+    volumes:
+      # Mount data directory for input audio files
+      - ../data:/app/data
+      # Mount results directory for output
+      - ../results:/app/results
+      # Mount current directory for development (optional)
+      # - .:/app
+    environment:
+      # Set HuggingFace token if needed for pyannote models
+      - HF_TOKEN=${HF_TOKEN:-}
+      # CPU thread configuration - defaults to all available cores if not set
+      - OMP_NUM_THREADS=${OMP_NUM_THREADS:-}
+      - MKL_NUM_THREADS=${MKL_NUM_THREADS:-}
+    # Use host networking for better performance (optional)
+    # network_mode: host
+    stdin_open: true
+    tty: true
+    # Override default command to keep container running
+    command: tail -f /dev/null
+
+  # Alternative service for running specific tasks
+  whisper-transcribe:
+    build:
+      context: ..
+      dockerfile: deployment/Dockerfile
+    image: whisper:latest
+    volumes:
+      - ../data:/app/data
+      - ../results:/app/results
+    environment:
+      - HF_TOKEN=${HF_TOKEN:-}
+    # Example: transcribe all audio files in data directory
+    # Customize this command as needed
+    command: sh -c "whisper /app/data/*.wav --model base --output_dir /app/results"
+    profiles:
+      - transcribe
+
+  # Service for running ASR_SD benchmarks
+  whisper-benchmark:
+    build:
+      context: ..
+      dockerfile: deployment/Dockerfile
+    image: whisper:latest
+    volumes:
+      - ../data:/app/data
+      - ../results:/app/results
+    environment:
+      - HF_TOKEN=${HF_TOKEN:-}
+      - OMP_NUM_THREADS=${OMP_NUM_THREADS:-}
+    # Example benchmark command
+    command: python ASR_SD/benchmarks/benchmark_pyannote_cpu.py /app/data/audio.wav --hf-token ${HF_TOKEN} --output /app/results/benchmark.json
+    profiles:
+      - benchmark
